@@ -34,6 +34,15 @@ import logging
 import random
 import grpc
 from pathlib import Path
+from collections import Counter
+
+from Leadpoet.lead_pipeline.starter import (
+    LeadCache,
+    MinerRequest,
+    StarterConfig,
+    StarterMiner,
+    load_local_pool_candidates,
+)
 
 
 class _SilenceInvalidRequest(logging.Filter):
@@ -70,6 +79,11 @@ class Miner(BaseMinerNeuron):
         self.cloud_task: Optional[asyncio.Task] = None
         self._bg_interval: int = 60
         self._miner_hotkey: Optional[str] = None
+
+        self._starter_config = StarterConfig.from_env()
+        self._starter_cache = LeadCache(ttl_seconds=self._starter_config.dedupe_ttl_hours * 3600)
+        self._starter_miner = StarterMiner(config=self._starter_config, lead_cache=self._starter_cache)
+        self._starter_rejection_totals: Counter[str] = Counter()
         
         bt.logging.info(f"✅ Miner initialized (using trustless gateway - no JWT tokens)")
 
@@ -623,6 +637,35 @@ class Miner(BaseMinerNeuron):
             with self.sourcing_lock:
                 self.sourcing_mode = False
                 try:
+                    if self._starter_miner.enabled:
+                        req = MinerRequest.from_synapse(synapse)
+                        candidates = load_local_pool_candidates()
+                        leads, metrics = self._starter_miner.handle_request(req, candidates=candidates)
+                        self._starter_rejection_totals.update(metrics.rejected)
+
+                        bt.logging.info(
+                            json.dumps(
+                                {
+                                    "event": "starter_miner_request",
+                                    "caller_hotkey": req.caller_hotkey,
+                                    "requested_num_leads": req.num_leads,
+                                    "returned_num_leads": metrics.accepted,
+                                    "rejected": metrics.rejected,
+                                    "rejection_totals": dict(self._starter_rejection_totals),
+                                    "latency_ms": metrics.latency_ms,
+                                    "overall_latency_ms": int((time.time() - start_time) * 1000),
+                                    "starter_max_leads": self._starter_config.max_leads,
+                                    "dedupe_ttl_hours": self._starter_config.dedupe_ttl_hours,
+                                },
+                                sort_keys=True,
+                            )
+                        )
+
+                        synapse.leads = leads
+                        synapse.dendrite.status_code = 200
+                        synapse.dendrite.status_message = "OK"
+                        synapse.dendrite.process_time = str(time.time() - start_time)
+                        return synapse
                     target_ind = classify_industry(
                         synapse.business_desc) or synapse.industry
                     print(f"🔍 Target industry inferred: {target_ind or 'any'}")
@@ -756,12 +799,52 @@ class Miner(BaseMinerNeuron):
     async def handle_lead_request(self, request):
         print(f"\n🟡 RECEIVED QUERY from validator: {await request.text()}")
         bt.logging.info(f"Received HTTP lead request: {await request.text()}")
+        start_time = time.time()
         try:
             data = await request.json()
             num_leads = data.get("num_leads", 1)
             industry = data.get("industry")  # legacy field – may be empty
             region = data.get("region")
             business_desc = data.get("business_desc", "")
+
+            if self._starter_miner.enabled:
+                req = MinerRequest(
+                    num_leads=int(num_leads or 0),
+                    business_desc=str(business_desc or ""),
+                    industry=str(industry or ""),
+                    region=str(region or ""),
+                    caller_hotkey="http",
+                )
+                candidates = load_local_pool_candidates()
+                leads, metrics = self._starter_miner.handle_request(req, candidates=candidates)
+                self._starter_rejection_totals.update(metrics.rejected)
+
+                bt.logging.info(
+                    json.dumps(
+                        {
+                            "event": "starter_miner_http_request",
+                            "requested_num_leads": req.num_leads,
+                            "returned_num_leads": metrics.accepted,
+                            "rejected": metrics.rejected,
+                            "rejection_totals": dict(self._starter_rejection_totals),
+                            "latency_ms": metrics.latency_ms,
+                            "overall_latency_ms": int((time.time() - start_time) * 1000),
+                            "starter_max_leads": self._starter_config.max_leads,
+                            "dedupe_ttl_hours": self._starter_config.dedupe_ttl_hours,
+                        },
+                        sort_keys=True,
+                    )
+                )
+
+                return web.json_response(
+                    {
+                        "leads": leads,
+                        "status_code": 200,
+                        "status_message": "OK",
+                        "process_time": str(time.time() - start_time),
+                    },
+                    status=200,
+                )
 
             print("⏸️  Stopping sourcing, switching to curation mode...")
 
@@ -859,7 +942,7 @@ class Miner(BaseMinerNeuron):
                         "status_code": 404,
                         "status_message":
                         "No valid leads found matching criteria",
-                        "process_time": "0"
+                        "process_time": str(time.time() - start_time)
                     },
                     status=404)
 
@@ -884,7 +967,7 @@ class Miner(BaseMinerNeuron):
                 "leads": top_leads,
                 "status_code": 200,
                 "status_message": "OK",
-                "process_time": "0"
+                "process_time": str(time.time() - start_time)
             })
         except Exception as e:
             print(f"❌ Error curating leads: {e}")
@@ -894,7 +977,7 @@ class Miner(BaseMinerNeuron):
                     "leads": [],
                     "status_code": 500,
                     "status_message": f"Error: {str(e)}",
-                    "process_time": "0"
+                    "process_time": str(time.time() - start_time)
                 },
                 status=500)
 
